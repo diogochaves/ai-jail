@@ -619,18 +619,7 @@ pub(crate) fn command_paths_under(
     config: &Config,
     root: &Path,
 ) -> Vec<PathBuf> {
-    let path_env = if config.lockdown_enabled() {
-        LOCKDOWN_PATH.to_string()
-    } else {
-        // PATH is allowlisted even without --inherit-env. Apply the same
-        // explicit overrides as the child before choosing its executable.
-        let host: Vec<_> = std::env::vars().collect();
-        crate::config::filtered_child_env(config.env_pass(), &host)
-            .into_iter()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| value)
-            .unwrap_or_default()
-    };
+    let path_env = child_path_env(config);
     let mut paths = Vec::new();
     for executable in crate::command::executable_candidates(&config.command) {
         for path in command_paths_under_impl(executable, root, &path_env) {
@@ -642,11 +631,26 @@ pub(crate) fn command_paths_under(
     paths
 }
 
-fn command_paths_under_impl(
-    cmd: &str,
-    root: &Path,
-    path_env: &str,
-) -> Vec<PathBuf> {
+/// The `PATH` the sandboxed command is looked up on: the lockdown `PATH`
+/// under `--lockdown`, else the host's after the child's own overrides.
+pub(crate) fn child_path_env(config: &Config) -> String {
+    if config.lockdown_enabled() {
+        LOCKDOWN_PATH.to_string()
+    } else {
+        // PATH is allowlisted even without --inherit-env. Apply the same
+        // explicit overrides as the child before choosing its executable.
+        let host: Vec<_> = std::env::vars().collect();
+        crate::config::filtered_child_env(config.env_pass(), &host)
+            .into_iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value)
+            .unwrap_or_default()
+    }
+}
+
+/// `cmd` as exec would find it: as given when it holds a `/`, else the first
+/// executable file named `cmd` in `path_env`.
+pub(crate) fn find_executable(cmd: &str, path_env: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let is_executable_file = |p: &Path| {
@@ -655,17 +659,23 @@ fn command_paths_under_impl(
             .unwrap_or(false)
     };
 
-    let start = if cmd.contains('/') {
-        PathBuf::from(cmd)
+    if cmd.contains('/') {
+        Some(PathBuf::from(cmd))
     } else {
-        match path_env
+        path_env
             .split(':')
             .map(|d| Path::new(d).join(cmd))
             .find(|c| is_executable_file(c))
-        {
-            Some(p) => p,
-            None => return vec![],
-        }
+    }
+}
+
+fn command_paths_under_impl(
+    cmd: &str,
+    root: &Path,
+    path_env: &str,
+) -> Vec<PathBuf> {
+    let Some(start) = find_executable(cmd, path_env) else {
+        return vec![];
     };
 
     let mut paths: Vec<PathBuf> = Vec::new();

@@ -1493,6 +1493,193 @@ fn landlock_wrapper_args(
     args
 }
 
+/// How long mise on the host may take to name the binary behind one of its
+/// command wrappers.
+const MISE_WHICH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// `config` with its command pointed at the binary a mise command wrapper
+/// stands for, or `None` to launch the command as given.
+///
+/// mise can put a tool on `PATH` as a command wrapper: a symlink named after
+/// the tool, in `<mise data dir>/command-wrappers/bin`, to the `mise` binary,
+/// which reads its `argv[0]` and runs the tool. Omarchy 4.5 installs its
+/// agent CLIs that way (`claude`, `codex`, `grok`), as lazy tools that update
+/// themselves before they run (`auto_update`). In the sandbox the wrapper
+/// cannot do that: mise's data dir is read-only (or not mounted), its cache
+/// is the jail's own and empty, and the version list is not reachable, so
+/// mise stops (`Failed to install aqua:anthropics/claude-code@latest`) and
+/// the agent never starts. `/usr/bin/mise` is always mounted, so the wrapper
+/// runs, and fails, with `--no-mise` too.
+///
+/// The host's mise knows which installed binary the wrapper would run
+/// (`mise which NAME`). It is asked offline and from `$HOME`, so it neither
+/// downloads anything nor reads the project's mise config, and its answer is
+/// launched instead: the command binary mounts, Landlock and the dry run all
+/// see that path, saved policy never does. An answer that is not an
+/// executable file with the wrapper's name keeps the wrapper, with a warning
+/// that says how to start the tool. `--lockdown` is left alone: its fixed
+/// `PATH` holds no wrapper.
+pub(crate) fn resolve_mise_command_wrapper(
+    config: &Config,
+    verbose: bool,
+) -> Option<Config> {
+    if config.lockdown_enabled() {
+        return None;
+    }
+    let cmd = config.command.first()?;
+    let wrapper = super::find_executable(cmd, &super::child_path_env(config))?;
+    let mise = mise_command_wrapper_target(&wrapper)?;
+    let target = cached_mise_which(&wrapper, &mise, verbose)?;
+    let mut resolved = config.clone();
+    resolved.command[0] = target.display().to_string();
+    Some(resolved)
+}
+
+/// The `mise` binary `wrapper` is a command wrapper for: a symlink in a
+/// `command-wrappers/bin` directory whose target is a file named `mise`.
+fn mise_command_wrapper_target(wrapper: &Path) -> Option<PathBuf> {
+    let is_link = wrapper
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink());
+    let dir = wrapper.parent()?;
+    let in_wrappers = dir.file_name()? == "bin"
+        && dir.parent()?.file_name()? == "command-wrappers";
+    if !is_link || !in_wrappers || wrapper.file_name()? == "mise" {
+        return None;
+    }
+    let mise = wrapper.canonicalize().ok()?;
+    (mise.file_name()? == "mise" && mise.is_file()).then_some(mise)
+}
+
+/// [`ask_mise_which`] once per wrapper and process: `build` and `dry_run`
+/// can both resolve the same command, and the warning is said once.
+fn cached_mise_which(
+    wrapper: &Path,
+    mise: &Path,
+    verbose: bool,
+) -> Option<PathBuf> {
+    use std::sync::{Mutex, OnceLock};
+    type Answers = Mutex<Vec<(PathBuf, Option<PathBuf>)>>;
+    static ANSWERS: OnceLock<Answers> = OnceLock::new();
+    let answers = ANSWERS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut answers = answers.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, known)) = answers.iter().find(|(w, _)| w == wrapper) {
+        return known.clone();
+    }
+    let name = wrapper.file_name()?.to_string_lossy().into_owned();
+    let answer = match ask_mise_which(
+        mise,
+        &name,
+        &super::home_dir(),
+        MISE_WHICH_TIMEOUT,
+    ) {
+        Ok(target) => {
+            if verbose {
+                output::verbose(&format!(
+                    "Command: {} is a mise command wrapper; running {}, \
+                     which mise on the host resolves it to",
+                    wrapper.display(),
+                    target.display()
+                ));
+            }
+            Some(target)
+        }
+        Err(why) => {
+            output::warn(&format!(
+                "{name} is a mise command wrapper ({}), and mise on the \
+                 host did not name the binary it runs: {why}. Launching \
+                 the wrapper, which cannot update or install {name} inside \
+                 the sandbox; if it fails, run {name} once outside ai-jail, \
+                 or launch the binary itself (mise which {name}).",
+                wrapper.display()
+            ));
+            None
+        }
+    };
+    answers.push((wrapper.to_path_buf(), answer.clone()));
+    answer
+}
+
+/// `mise which NAME`, run with `MISE_OFFLINE=1` from `home` and stopped
+/// after `timeout`: the canonical path it prints, when that is an executable
+/// file named `name` and not `mise` itself.
+fn ask_mise_which(
+    mise: &Path,
+    name: &str,
+    home: &Path,
+    timeout: std::time::Duration,
+) -> Result<PathBuf, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let which = format!("`mise which {name}`");
+    let mut child = Command::new(mise)
+        .arg("which")
+        .arg(name)
+        .current_dir(home)
+        .env("MISE_OFFLINE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", mise.display()))?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{which} took longer than {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{which} failed: {e}"));
+            }
+        }
+    };
+    if !status.success() {
+        return Err(format!("{which} failed ({status})"));
+    }
+    let mut out = String::new();
+    if let Some(stdout) = child.stdout.take() {
+        let _ = stdout.take(4096).read_to_string(&mut out);
+    }
+    let line = out.strip_suffix('\n').unwrap_or(&out);
+    if line.is_empty() || line.contains('\n') {
+        return Err(format!("{which} did not print one path"));
+    }
+    let path = Path::new(line);
+    if !path.is_absolute() {
+        return Err(format!("{which} printed a relative path"));
+    }
+    let target = path
+        .canonicalize()
+        .map_err(|e| format!("{which} printed {line}: {e}"))?;
+    let executable = target
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    if !executable {
+        return Err(format!("{which} printed {line}, not an executable file"));
+    }
+    if target.file_name() != Some(std::ffi::OsStr::new(name)) {
+        return Err(format!("{which} printed {line}, not a {name} binary"));
+    }
+    if target == mise {
+        return Err(format!("{which} printed mise itself"));
+    }
+    Ok(target)
+}
+
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
@@ -1501,6 +1688,8 @@ pub fn build(
     proxy_socket: Option<&Path>,
     bridge_sockets: &super::BridgeSockets,
 ) -> Result<Command, String> {
+    let resolved = resolve_mise_command_wrapper(config, verbose);
+    let config = resolved.as_ref().unwrap_or(config);
     let sources = MountSources::from_guard(guard);
     let mount_set =
         discover_mounts_full(config, project_dir, &sources, verbose)?;
@@ -1723,6 +1912,8 @@ pub fn dry_run(
     proxy_socket: Option<&Path>,
     bridge_sockets: &super::BridgeSockets,
 ) -> Result<String, String> {
+    let resolved = resolve_mise_command_wrapper(config, verbose);
+    let config = resolved.as_ref().unwrap_or(config);
     let sources = MountSources {
         create_dirs: false,
         ..MountSources::from_guard(guard)
@@ -9032,5 +9223,224 @@ nameserver 8.8.8.8
             "CLAUDE_CONFIG_DIR must not appear when \
              claude_dir is None"
         );
+    }
+
+    /// A home with Omarchy's layout: `mise` (a script with `body`) in
+    /// `bin/`, the command wrapper `claude` linked to it in
+    /// `.local/share/mise/command-wrappers/bin/`, and the installed
+    /// `claude` in `.local/share/mise/installs/claude/2.1.0/`.
+    fn mise_wrapper_fixture(tag: &str, body: &str) -> PathBuf {
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-mise-wrapper-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let wrappers = home.join(".local/share/mise/command-wrappers/bin");
+        let installs = home.join(".local/share/mise/installs/claude/2.1.0");
+        for dir in [&home.join("bin"), &wrappers, &installs] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let exec = |path: &Path, text: &str| {
+            std::fs::write(path, text).unwrap();
+            std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        };
+        exec(&home.join("bin/mise"), &format!("#!/bin/sh\n{body}\n"));
+        exec(&installs.join("claude"), "#!/bin/sh\n");
+        std::os::unix::fs::symlink(
+            home.join("bin/mise"),
+            wrappers.join("claude"),
+        )
+        .unwrap();
+        home.canonicalize().unwrap()
+    }
+
+    fn installed_claude(home: &Path) -> PathBuf {
+        home.join(".local/share/mise/installs/claude/2.1.0/claude")
+    }
+
+    #[test]
+    fn mise_command_wrapper_is_a_link_to_mise_in_command_wrappers() {
+        let home = mise_wrapper_fixture("target", "exit 0");
+        let wrappers = home.join(".local/share/mise/command-wrappers/bin");
+        assert_eq!(
+            mise_command_wrapper_target(&wrappers.join("claude")),
+            Some(home.join("bin/mise"))
+        );
+        // The same link anywhere else is not a command wrapper.
+        std::os::unix::fs::symlink(home.join("bin/mise"), home.join("claude"))
+            .unwrap();
+        assert_eq!(mise_command_wrapper_target(&home.join("claude")), None);
+        // Nor is a link there to another program, or a plain file there.
+        std::os::unix::fs::symlink(
+            installed_claude(&home),
+            wrappers.join("other"),
+        )
+        .unwrap();
+        assert_eq!(mise_command_wrapper_target(&wrappers.join("other")), None);
+        std::fs::write(wrappers.join("plain"), "#!/bin/sh\n").unwrap();
+        assert_eq!(mise_command_wrapper_target(&wrappers.join("plain")), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mise_which_is_asked_offline_from_home() {
+        let home = mise_wrapper_fixture("ask", "");
+        let log = home.join("log");
+        let answer = installed_claude(&home);
+        std::fs::write(
+            home.join("bin/mise"),
+            format!(
+                "#!/bin/sh\nprintf '%s %s %s %s\\n' \"$1\" \"$2\" \
+                 \"${{MISE_OFFLINE-unset}}\" \"$PWD\" > '{}'\n\
+                 echo '{}'\n",
+                log.display(),
+                answer.display()
+            ),
+        )
+        .unwrap();
+        let got = ask_mise_which(
+            &home.join("bin/mise"),
+            "claude",
+            &home,
+            MISE_WHICH_TIMEOUT,
+        );
+        assert_eq!(got, Ok(answer));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("which claude 1 {}\n", home.display())
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mise_which_answers_that_are_not_the_tool_are_refused() {
+        let home = mise_wrapper_fixture("refuse", "");
+        let mise = home.join("bin/mise");
+        let claude = installed_claude(&home);
+        let other = claude.with_file_name("other");
+        std::fs::write(&other, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            &other,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let data = claude.with_file_name("data");
+        std::fs::write(&data, "").unwrap();
+        let cases = [
+            ("exit 1", "failed"),
+            ("echo", "did not print one path"),
+            (
+                &*format!("echo '{0}'; echo '{0}'", claude.display()),
+                "one path",
+            ),
+            ("echo claude", "relative path"),
+            ("echo /nonexistent/claude", "No such file"),
+            (&*format!("echo '{}'", data.display()), "not an executable"),
+            (
+                &*format!("echo '{}'", other.display()),
+                "not a claude binary",
+            ),
+            ("sleep 5", "took longer than"),
+        ];
+        for (body, why) in cases {
+            std::fs::write(&mise, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let got = ask_mise_which(
+                &mise,
+                "claude",
+                &home,
+                std::time::Duration::from_millis(200),
+            );
+            assert!(
+                got.as_ref().is_err_and(|e| e.contains(why)),
+                "{body}: {got:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mise_which_naming_mise_itself_is_refused() {
+        let home = mise_wrapper_fixture("self", "");
+        // A tool named mise would be the wrapper's own target.
+        let mise = home.join("bin/mise");
+        std::fs::write(
+            &mise,
+            format!("#!/bin/sh\necho '{}'\n", mise.display()),
+        )
+        .unwrap();
+        let got = ask_mise_which(&mise, "mise", &home, MISE_WHICH_TIMEOUT);
+        assert!(got.is_err_and(|e| e.contains("mise itself")));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mise_command_wrapper_on_path_launches_the_installed_binary() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = mise_wrapper_fixture("launch", "");
+        std::fs::write(
+            home.join("bin/mise"),
+            format!(
+                "#!/bin/sh\necho '{}'\n",
+                installed_claude(&home).display()
+            ),
+        )
+        .unwrap();
+        let wrappers = home.join(".local/share/mise/command-wrappers/bin");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set(
+            "PATH",
+            format!("{}:/usr/bin:/bin", wrappers.display()),
+        );
+        let config = Config {
+            command: vec!["claude".into(), "--version".into()],
+            ..Config::default()
+        };
+
+        let resolved = resolve_mise_command_wrapper(&config, false)
+            .expect("the wrapper is resolved");
+        assert_eq!(
+            resolved.command,
+            vec![
+                installed_claude(&home).display().to_string(),
+                "--version".to_string()
+            ]
+        );
+        // The launch and the command binary mount follow it.
+        let launch = crate::sandbox::build_launch_command(&Config {
+            no_mise: Some(true),
+            ..resolved.clone()
+        });
+        assert_eq!(
+            launch.program,
+            installed_claude(&home).display().to_string()
+        );
+        assert!(
+            crate::sandbox::command_paths_under(&resolved, &home).contains(
+                &home.join(".local/share/mise/installs/claude/2.1.0")
+            )
+        );
+        // Everything else is left as it was.
+        assert_eq!(
+            Config {
+                command: config.command.clone(),
+                ..resolved
+            },
+            config
+        );
+
+        // --lockdown and a command that is no wrapper keep the command.
+        let lockdown = Config {
+            lockdown: Some(true),
+            ..config.clone()
+        };
+        assert_eq!(resolve_mise_command_wrapper(&lockdown, false), None);
+        let plain = Config {
+            command: vec!["sh".into()],
+            ..config
+        };
+        assert_eq!(resolve_mise_command_wrapper(&plain, false), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

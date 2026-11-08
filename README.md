@@ -863,6 +863,17 @@ disable mise activation, so neither maps these paths. You can still add extra
 `ro_maps` from trusted global config if a tool lives elsewhere, or use
 `--no-private-home` when you deliberately want the whole host home.
 
+On Linux, a command that is a mise **command wrapper** (a link to `mise` in
+`<mise data dir>/command-wrappers/bin`, which is how Omarchy 4.5 installs
+`claude`, `codex` and `grok`) is launched as the binary it stands for. The
+wrapper updates or installs its tool before running it (`auto_update`), which
+cannot work in the sandbox, so ai-jail asks the host's mise first
+(`MISE_OFFLINE=1 mise which NAME`, from `$HOME`, so nothing is downloaded and
+no project config is read) and runs the installed binary it names. This
+applies with `--no-mise` too, since the wrapper is mise itself. If mise names
+nothing usable, ai-jail warns and launches the wrapper as before; running the
+tool once outside the sandbox installs it.
+
 ## Herdr
 
 [Herdr](https://herdr.dev/) runs outside the sandbox, one `ai-jail` per pane,
